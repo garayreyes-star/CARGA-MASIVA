@@ -7,9 +7,15 @@
  * ✅ Conserva ceros a la izquierda en SKU y Lote (Texto puro).
  * ✅ Correlativo de líneas (LineNum) reinicia por DMI/ODV.
  * ✅ Formato de fecha DD-MM-YYYY.
- * ✅ Columna L: Registro de FECHA/HORA ("INGRESADO").
+ * ✅ Columna L: MARCA (Hyundai, JAC, etc.)
+ * ✅ Columna M: Registro de FECHA/HORA ("INGRESADO").
+ * ✅ Columna N: ID_PEDIDO (viene de Flask).
  * 🌐 WEBHOOK: Integrado con Flask. Busca DMI en hoja "DMI" y deja ODV en blanco.
+ * 🔗 SYNC: Al exportar CSV, marca DIGITADO + ODV en Flask automáticamente.
  ***************************************************************/
+
+// ⚠️⚠️⚠️ CAMBIA ESTA URL POR LA TUYA DE PYTHONANYWHERE ⚠️⚠️⚠️
+const FLASK_BASE_URL = 'https://germany1983.pythonanywhere.com';
 
 const CM = {
   SHEET_LIST: 'LISTADO DE PRECIO',
@@ -20,26 +26,28 @@ const CM = {
   HEADER_ROW: 1,
 
   // ODV columns
-  COL_DMI: 1,
-  COL_ODV: 2,
-  COL_SKU: 3,
-  COL_LOTE: 4,
-  COL_PRECIO: 5,
-  COL_QTY: 6,
-  COL_SUBTOTAL: 7,
-  COL_STOCK_TOTAL: 8,
-  COL_STOCK_LOTE: 9,
-  COL_FALTAN: 10,
-  COL_ESTADO: 11,
-  COL_TIMESTAMP: 12, // NUEVA COLUMNA PARA FECHA Y HORA
+  COL_DMI: 1,          // A
+  COL_ODV: 2,          // B
+  COL_SKU: 3,          // C
+  COL_LOTE: 4,         // D
+  COL_PRECIO: 5,       // E
+  COL_QTY: 6,          // F
+  COL_SUBTOTAL: 7,     // G
+  COL_STOCK_TOTAL: 8,  // H
+  COL_STOCK_LOTE: 9,   // I
+  COL_FALTAN: 10,      // J
+  COL_ESTADO: 11,      // K
+  COL_MARCA: 12,       // L  ← MARCA
+  COL_TIMESTAMP: 13,   // M  ← INGRESADO (fecha/hora)
+  COL_PEDIDO_ID: 14,   // N  ← ID del pedido de Flask
 
-  SUMMARY_START_COL: 14,  // N
+  SUMMARY_START_COL: 16,  // P (resumen empieza aquí para no pisar col N)
   SUMMARY_TITLE_ROW: 1,
   SUMMARY_START_ROW: 2,
-  SUMMARY_TABLE_HEADER_ROW: 6,
+  SUMMARY_TABLE_HEADER_ROW: 7,
 
   LOTE_PREFERIDO: '7550',
-  CSV_SEPARATOR: ';', // Separador estándar para CSV
+  CSV_SEPARATOR: ';',
 
   BULK_THRESHOLD_CELLS: 60,
 
@@ -72,6 +80,10 @@ function doPost(e) {
          .setMimeType(ContentService.MimeType.JSON);
     }
 
+    // ★ Capturar el pedido_id que viene de Flask
+    const pedidoId = String(data.pedido_id || '').trim();
+
+    // Resolver DMI desde hoja DMI
     let finalDMI = String(data.dmi).trim(); 
     const shDMI = ss.getSheetByName('DMI');
     
@@ -85,6 +97,20 @@ function doPost(e) {
         if (rutUsuario === rutBuscado && dmiAsignado !== "") {
           finalDMI = dmiAsignado;
           break; 
+        }
+      }
+    }
+
+    // Resolver MARCA desde hoja DMI (columna C si existe)
+    let marca = '';
+    if (shDMI) {
+      const dmiData = shDMI.getDataRange().getDisplayValues();
+      const rutBuscado = String(data.dmi).trim().toLowerCase();
+      for (let i = 1; i < dmiData.length; i++) {
+        let rutUsuario = String(dmiData[i][0]).trim().toLowerCase();
+        if (rutUsuario === rutBuscado) {
+          marca = String(dmiData[i][2] || '').trim(); // columna C = marca
+          break;
         }
       }
     }
@@ -108,17 +134,36 @@ function doPost(e) {
       }
     }
 
-    // Pegar los datos base
+    // Pegar datos base (A-F)
     sh.getRange(startRow, 1, matrix.length, 6).setValues(matrix);
     
-    // Pegar la fecha y hora
+    // Pegar MARCA en columna L
+    if (marca) {
+      const marcaArray = Array(matrix.length).fill([marca]);
+      sh.getRange(startRow, CM.COL_MARCA, matrix.length, 1).setValues(marcaArray);
+    }
+
+    // Pegar FECHA/HORA en columna M
     const timestampStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd-MM-yyyy HH:mm:ss');
     const tsArray = Array(matrix.length).fill([timestampStr]);
     sh.getRange(startRow, CM.COL_TIMESTAMP, matrix.length, 1).setValues(tsArray);
 
+    // ★★★ Pegar PEDIDO_ID en columna N ★★★
+    if (pedidoId) {
+      const pidArray = Array(matrix.length).fill([pedidoId]);
+      sh.getRange(startRow, CM.COL_PEDIDO_ID, matrix.length, 1)
+        .setNumberFormat('@')
+        .setValues(pidArray);
+    }
+
     CM_recalcularODV();
 
-    return ContentService.createTextOutput(JSON.stringify({ status: 'Exito', lineas_procesadas: matrix.length }))
+    return ContentService.createTextOutput(JSON.stringify({ 
+      status: 'Exito', 
+      lineas_procesadas: matrix.length,
+      pedido_id: pedidoId,
+      dmi: finalDMI
+    }))
       .setMimeType(ContentService.MimeType.JSON);
 
   } catch (error) {
@@ -150,7 +195,9 @@ function onOpen() {
     .addItem('📦 Generar CSV (por cada DMI + ODV)', 'CM_exportarCSV_porDMIyODV')
     .addItem('📄 Generar CSV ÚNICO (todas las líneas)', 'generarXLSXUnico')
     .addSeparator()
-    .addItem('🧽 Limpiar ODV completa (A..L)', 'CM_limpiarODVCompleta')
+    .addItem('🔗 Sincronizar ODVs con Flask (marcar digitado)', 'CM_sincronizarConFlask')
+    .addSeparator()
+    .addItem('🧽 Limpiar ODV completa (A..N)', 'CM_limpiarODVCompleta')
     .addToUi();
 }
 
@@ -162,7 +209,7 @@ function CM_ensureODVColumn() {
   const sh = ss.getSheetByName(CM.SHEET_ODV);
   if (!sh) throw new Error(`No existe la hoja "${CM.SHEET_ODV}"`);
 
-  const headers = sh.getRange(1, 1, 1, Math.max(12, sh.getLastColumn()))
+  const headers = sh.getRange(1, 1, 1, Math.max(14, sh.getLastColumn()))
     .getDisplayValues()[0]
     .map(x => String(x||'').trim().toUpperCase());
 
@@ -199,7 +246,9 @@ function CM_setupODV() {
   sh.getRange(2, CM.COL_STOCK_TOTAL, rows, 1).setNumberFormat('0');
   sh.getRange(2, CM.COL_STOCK_LOTE, rows, 1).setNumberFormat('0');
   sh.getRange(2, CM.COL_FALTAN, rows, 1).setNumberFormat('0');
+  sh.getRange(2, CM.COL_MARCA, rows, 1).setNumberFormat('@');
   sh.getRange(2, CM.COL_TIMESTAMP, rows, 1).setNumberFormat('@');
+  sh.getRange(2, CM.COL_PEDIDO_ID, rows, 1).setNumberFormat('@');
 
   const setIfEmpty = (col, name) => {
     const cur = String(sh.getRange(1, col).getValue() || '').trim();
@@ -217,12 +266,14 @@ function CM_setupODV() {
   setIfEmpty(CM.COL_STOCK_LOTE, 'STOCK LOTE');
   setIfEmpty(CM.COL_FALTAN, 'FALTAN');
   setIfEmpty(CM.COL_ESTADO, 'ESTADO');
+  setIfEmpty(CM.COL_MARCA, 'MARCA');
   setIfEmpty(CM.COL_TIMESTAMP, 'INGRESADO');
+  setIfEmpty(CM.COL_PEDIDO_ID, 'ID_PEDIDO');
 
   CM_aplicarFormatoODV();
   CM_actualizarResumenDMI();
 
-  ss.toast('✅ ODV configurado (montos enteros sin formato).', 'Carga Masiva AG', 6);
+  ss.toast('✅ ODV configurado con MARCA + ID_PEDIDO.', 'Carga Masiva AG', 6);
 }
 
 function CM_prepararListadoTexto() {
@@ -238,7 +289,7 @@ function CM_prepararListadoTexto() {
 }
 
 /***************************************************************
- * AUTOCOMPLETAR ODV POR DMI (Optimizada para uso automático)
+ * AUTOCOMPLETAR ODV POR DMI
  ***************************************************************/
 function CM_autocompletarODVporDMI(mostrarToast = true) {
   const ss = SpreadsheetApp.getActive();
@@ -291,7 +342,7 @@ function CM_autocompletarODVporDMI(mostrarToast = true) {
 }
 
 /***************************************************************
- * onEdit (ODV) - CON MAGIA AUTOMÁTICA
+ * onEdit (ODV)
  ***************************************************************/
 function onEdit(e) {
   try {
@@ -363,8 +414,8 @@ function CM_recalcularODV() {
 
   const provider = getInventoryProviderBatch_();
   
-  // Ahora leemos hasta la columna de FECHA/HORA
-  const range = sh.getRange(2, 1, lastRow - 1, CM.COL_TIMESTAMP);
+  // Leemos hasta COL_PEDIDO_ID para no perder datos
+  const range = sh.getRange(2, 1, lastRow - 1, CM.COL_PEDIDO_ID);
   const data = range.getDisplayValues();
   const nowStr = Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'dd-MM-yyyy HH:mm:ss');
 
@@ -382,7 +433,7 @@ function CM_recalcularODV() {
       row[CM.COL_STOCK_LOTE - 1] = '';
       row[CM.COL_FALTAN - 1] = '';
       row[CM.COL_ESTADO - 1] = '';
-      row[CM.COL_TIMESTAMP - 1] = '';
+      // NO borramos MARCA (12), TIMESTAMP (13) ni PEDIDO_ID (14)
       continue;
     }
 
@@ -393,6 +444,8 @@ function CM_recalcularODV() {
     if (!row[CM.COL_TIMESTAMP - 1]) {
       row[CM.COL_TIMESTAMP - 1] = nowStr;
     }
+
+    // PEDIDO_ID (col 14): NUNCA se toca en recálculo
 
     if (!lots.length) {
       row[CM.COL_LOTE - 1] = '';
@@ -511,7 +564,93 @@ function CM_updateRow_(shODV, row, provider) {
 }
 
 /***************************************************************
- * 📊 NUEVO: FUNCIÓN PARA REGISTRAR EN EL DASHBOARD
+ * 🔗 SINCRONIZACIÓN CON FLASK
+ ***************************************************************/
+function CM_enviarDigitadoAFlask(lineas) {
+  if (!lineas || lineas.length === 0) return;
+
+  const updates = [];
+  const seen = new Set();
+
+  for (const l of lineas) {
+    const pid = String(l.pedidoId || '').trim();
+    const odv = String(l.odv || '').trim();
+    if (!pid || !odv || seen.has(pid)) continue;
+    seen.add(pid);
+    updates.push({ pedido_id: parseInt(pid), odv: odv });
+  }
+
+  if (updates.length === 0) {
+    SpreadsheetApp.getActive().toast('⚠️ No hay pedidos con ID+ODV para enviar a Flask.', 'Sync Flask', 6);
+    return;
+  }
+
+  const url = FLASK_BASE_URL + '/api/actualizar_odv';
+
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify({ actualizaciones: updates }),
+      muteHttpExceptions: true
+    });
+
+    const code = response.getResponseCode();
+    const body = JSON.parse(response.getContentText());
+
+    if (code === 200 && body.status === 'ok') {
+      SpreadsheetApp.getActive().toast(
+        `✅ Flask actualizado: ${body.actualizados} pedido(s) marcados como DIGITADO con ODV.`,
+        'Sync Flask', 8
+      );
+    } else {
+      SpreadsheetApp.getActive().toast(
+        `⚠️ Flask respondió ${code}: ${body.mensaje || 'Error desconocido'}`,
+        'Sync Flask', 8
+      );
+    }
+  } catch (err) {
+    SpreadsheetApp.getActive().toast(
+      `❌ Error conectando con Flask: ${err.message}`,
+      'Sync Flask', 10
+    );
+    console.error('Error CM_enviarDigitadoAFlask:', err);
+  }
+}
+
+function CM_sincronizarConFlask() {
+  const ss = SpreadsheetApp.getActive();
+  const sh = ss.getSheetByName(CM.SHEET_ODV);
+  if (!sh) throw new Error('No existe la hoja ' + CM.SHEET_ODV);
+
+  const lastRow = sh.getLastRow();
+  if (lastRow < 2) {
+    ss.toast('No hay datos en la hoja.', 'Sync Flask', 5);
+    return;
+  }
+
+  const odvVals = sh.getRange(2, CM.COL_ODV, lastRow - 1, 1).getDisplayValues();
+  const pidVals = sh.getRange(2, CM.COL_PEDIDO_ID, lastRow - 1, 1).getDisplayValues();
+
+  const lineas = [];
+  for (let i = 0; i < odvVals.length; i++) {
+    const odv = String(odvVals[i][0] || '').trim();
+    const pid = String(pidVals[i][0] || '').trim();
+    if (odv && pid) {
+      lineas.push({ pedidoId: pid, odv: odv });
+    }
+  }
+
+  if (lineas.length === 0) {
+    ss.toast('No hay filas con ODV + ID_PEDIDO para sincronizar.', 'Sync Flask', 6);
+    return;
+  }
+
+  CM_enviarDigitadoAFlask(lineas);
+}
+
+/***************************************************************
+ * 📊 HISTORIAL
  ***************************************************************/
 function CM_registrarHistorial(tipoExportacion, lineas) {
   if (!lineas || lineas.length === 0) return;
@@ -580,9 +719,8 @@ function CM_registrarHistorial(tipoExportacion, lineas) {
   }
 }
 
-
 // =========================================================================
-// 🚀 PUENTES (WRAPPERS) PARA QUE LOS BOTONES DIBUJADOS NO SE ROMPAN
+// PUENTES (WRAPPERS) PARA BOTONES DIBUJADOS
 // =========================================================================
 function generarXLSXUnico() {
   CM_exportarCSV_unico();
@@ -590,11 +728,9 @@ function generarXLSXUnico() {
 function CM_exportarXLSX_porDMIyODV() {
   CM_exportarCSV_porDMIyODV();
 }
-// =========================================================================
-
 
 /***************************************************************
- * EXPORT CSV POR DMI + ODV 
+ * EXPORT CSV POR DMI + ODV
  ***************************************************************/
 function CM_exportarCSV_porDMIyODV() {
   const ss = SpreadsheetApp.getActive();
@@ -610,10 +746,11 @@ function CM_exportarCSV_porDMIyODV() {
     return;
   }
 
-  const data = shODV.getRange(2, 1, lastRow - 1, CM.COL_ESTADO).getDisplayValues();
+  const data = shODV.getRange(2, 1, lastRow - 1, CM.COL_PEDIDO_ID).getDisplayValues();
 
   const groups = new Map();
-  const todasLasLineas = []; 
+  const todasLasLineas = [];
+  const lineasParaFlask = [];
 
   for (const r of data) {
     const dmi = String(r[CM.COL_DMI - 1] || '').trim();
@@ -625,9 +762,14 @@ function CM_exportarCSV_porDMIyODV() {
     const precioTxt = String(r[CM.COL_PRECIO - 1] || '').trim();
     const qtyTxt = String(r[CM.COL_QTY - 1] || '').trim();
     const subtotalTxt = String(r[CM.COL_SUBTOTAL - 1] || '').trim();
+    const pedidoId = String(r[CM.COL_PEDIDO_ID - 1] || '').trim();
 
-    const lineObj = { dmi, odv, sku, lote, precioTxt, qtyTxt, subtotalTxt };
+    const lineObj = { dmi, odv, sku, lote, precioTxt, qtyTxt, subtotalTxt, pedidoId };
     todasLasLineas.push(lineObj);
+
+    if (pedidoId && odv) {
+      lineasParaFlask.push({ pedidoId: pedidoId, odv: odv });
+    }
 
     const key = `${dmi}||${odv}`;
     if (!groups.has(key)) groups.set(key, { dmi, odv, lines: [] });
@@ -641,7 +783,6 @@ function CM_exportarCSV_porDMIyODV() {
 
   const folder = getOrCreateFolder_(CM.EXPORT_FOLDER_NAME);
   
-  // Lee las columnas de la plantilla dinámicamente
   const tplLastCol = shTpl.getLastColumn();
   const tplHeaders = shTpl.getRange(1, 1, 1, tplLastCol).getDisplayValues()[0];
   const tplDefaults = shTpl.getRange(2, 1, 1, tplLastCol).getDisplayValues()[0];
@@ -668,7 +809,6 @@ function CM_exportarCSV_porDMIyODV() {
   for (const g of groups.values()) {
     const outName = `CARGA_${sanitize_(g.dmi)}_${sanitize_(g.odv)}_${Utilities.formatDate(new Date(), Session.getScriptTimeZone(), 'yyyyMMdd_HHmm')}.csv`;
     
-    // Iniciar las filas del CSV con el encabezado
     const csvRows = [tplHeaders];
     
     for (let i = 0; i < g.lines.length; i++) {
@@ -678,7 +818,7 @@ function CM_exportarCSV_porDMIyODV() {
       if (idxCust !== undefined) newRow[idxCust] = l.dmi;
       if (idxSalesId !== undefined) newRow[idxSalesId] = l.odv;
       if (idxShip !== undefined) newRow[idxShip] = today;
-      if (idxLine !== undefined) newRow[idxLine] = i + 1; // Correlativo individual
+      if (idxLine !== undefined) newRow[idxLine] = i + 1;
       if (idxBatch !== undefined) newRow[idxBatch] = l.lote;
       if (idxItem !== undefined) newRow[idxItem] = l.sku;
       if (idxPrice !== undefined) newRow[idxPrice] = parseCLPFromText_(l.precioTxt);
@@ -696,7 +836,12 @@ function CM_exportarCSV_porDMIyODV() {
 
   CM_registrarHistorial('DMI INDIVIDUALES (CSV)', todasLasLineas);
 
-  ss.toast(`✅ CSVs generados exitosamente: ${links.length}`, 'Export', 10);
+  // ★★★ Enviar ODV + marcar DIGITADO en Flask ★★★
+  if (lineasParaFlask.length > 0) {
+    CM_enviarDigitadoAFlask(lineasParaFlask);
+  }
+
+  ss.toast(`✅ CSVs generados: ${links.length} | Flask sincronizado`, 'Export', 10);
 }
 
 /***************************************************************
@@ -716,14 +861,17 @@ function CM_exportarCSV_unico() {
     return;
   }
 
-  const data = shODV.getRange(2, 1, lastRow - 1, CM.COL_ESTADO).getDisplayValues();
+  const data = shODV.getRange(2, 1, lastRow - 1, CM.COL_PEDIDO_ID).getDisplayValues();
   const lines = [];
+  const lineasParaFlask = [];
   
   for (const r of data) {
     const dmi = String(r[CM.COL_DMI - 1] || '').trim();
     const odv = String(r[CM.COL_ODV - 1] || '').trim();
     const sku = String(r[CM.COL_SKU - 1] || '').trim();
     if (!dmi || !odv || !sku) continue;
+
+    const pedidoId = String(r[CM.COL_PEDIDO_ID - 1] || '').trim();
 
     lines.push({
       dmi,
@@ -733,7 +881,12 @@ function CM_exportarCSV_unico() {
       precioTxt: String(r[CM.COL_PRECIO - 1] || '').trim(),
       qtyTxt: String(r[CM.COL_QTY - 1] || '').trim(),
       subtotalTxt: String(r[CM.COL_SUBTOTAL - 1] || '').trim(),
+      pedidoId: pedidoId,
     });
+
+    if (pedidoId && odv) {
+      lineasParaFlask.push({ pedidoId, odv });
+    }
   }
 
   if (!lines.length) {
@@ -741,7 +894,6 @@ function CM_exportarCSV_unico() {
     return;
   }
 
-  // Ordenar para agrupar por DMI y ODV
   lines.sort((a,b) => a.dmi.localeCompare(b.dmi) || a.odv.localeCompare(b.odv) || a.sku.localeCompare(b.sku));
 
   const folder = getOrCreateFolder_(CM.EXPORT_FOLDER_NAME);
@@ -777,7 +929,6 @@ function CM_exportarCSV_unico() {
   for (let i = 0; i < lines.length; i++) {
     const l = lines[i];
     
-    // Correlativo inteligente que se reinicia por ODV
     if (l.dmi !== currentDMI || l.odv !== currentODV) {
       currentDMI = l.dmi;
       currentODV = l.odv;
@@ -807,12 +958,17 @@ function CM_exportarCSV_unico() {
 
   CM_registrarHistorial('ARCHIVO ÚNICO CSV', lines);
 
-  ss.toast(`✅ CSV ÚNICO creado en Drive`, 'Export', 10);
+  // ★★★ Enviar ODV + marcar DIGITADO en Flask ★★★
+  if (lineasParaFlask.length > 0) {
+    CM_enviarDigitadoAFlask(lineasParaFlask);
+  }
+
+  ss.toast(`✅ CSV ÚNICO creado en Drive | Flask sincronizado`, 'Export', 10);
   SpreadsheetApp.getUi().alert('CSV ÚNICO creado en Drive:\n\n' + file.getUrl());
 }
 
 /***************************************************************
- * BOTONES: Buscar otros lotes (DESDOBLAR OPTIMIZADO)
+ * BUSCAR OTROS LOTES (DESDOBLAR)
  ***************************************************************/
 function CM_buscarOtroLoteFilaSeleccionada() {
   const ss = SpreadsheetApp.getActive();
@@ -856,7 +1012,7 @@ function CM_buscarOtrosLotesPendientes() {
 }
 
 function desdoblarSiFaltaStock_(shODV, row, provider) {
-  const rowRange = shODV.getRange(row, 1, 1, CM.COL_TIMESTAMP);
+  const rowRange = shODV.getRange(row, 1, 1, CM.COL_PEDIDO_ID);
   const rowData = rowRange.getDisplayValues()[0];
 
   const dmi = rowData[CM.COL_DMI - 1];
@@ -864,7 +1020,9 @@ function desdoblarSiFaltaStock_(shODV, row, provider) {
   const skuRaw = String(rowData[CM.COL_SKU - 1]).trim();
   const loteActual = String(rowData[CM.COL_LOTE - 1]).trim();
   const precioDisplay = String(rowData[CM.COL_PRECIO - 1]).trim();
+  const marcaOriginal = String(rowData[CM.COL_MARCA - 1] || '').trim();
   const timestampOriginal = String(rowData[CM.COL_TIMESTAMP - 1] || '').trim();
+  const pedidoIdOriginal = String(rowData[CM.COL_PEDIDO_ID - 1] || '').trim();
   let qtyTotal = toInt_(rowData[CM.COL_QTY - 1]);
 
   if (!skuRaw || qtyTotal <= 0) return false;
@@ -925,7 +1083,7 @@ function desdoblarSiFaltaStock_(shODV, row, provider) {
     if (String(a.lote) === CM.LOTE_PREFERIDO) estado += ' | Usa lote 7550'; 
     if (precioCLP <= 0) estado += ' | Falta PRECIO';
 
-    const newRow = new Array(CM.COL_TIMESTAMP).fill('');
+    const newRow = new Array(CM.COL_PEDIDO_ID).fill('');
     newRow[CM.COL_DMI - 1] = dmi;
     newRow[CM.COL_ODV - 1] = odv;
     newRow[CM.COL_SKU - 1] = "'" + skuRaw; 
@@ -937,7 +1095,9 @@ function desdoblarSiFaltaStock_(shODV, row, provider) {
     newRow[CM.COL_STOCK_LOTE - 1] = a.stock;
     newRow[CM.COL_FALTAN - 1] = 0;
     newRow[CM.COL_ESTADO - 1] = estado;
-    newRow[CM.COL_TIMESTAMP - 1] = timestampOriginal; 
+    newRow[CM.COL_MARCA - 1] = marcaOriginal;
+    newRow[CM.COL_TIMESTAMP - 1] = timestampOriginal;
+    newRow[CM.COL_PEDIDO_ID - 1] = pedidoIdOriginal;
     outputData.push(newRow);
   });
 
@@ -947,10 +1107,11 @@ function desdoblarSiFaltaStock_(shODV, row, provider) {
     outputData[lastR][CM.COL_ESTADO - 1] = `PARCIAL (faltan ${remain})` + (precioCLP <= 0 ? ' | Falta PRECIO' : '');
   }
 
-  shODV.getRange(row, 1, allocations.length, CM.COL_TIMESTAMP).setValues(outputData);
+  shODV.getRange(row, 1, allocations.length, CM.COL_PEDIDO_ID).setValues(outputData);
   shODV.getRange(row, CM.COL_SKU, allocations.length, 1).setNumberFormat('@');
   shODV.getRange(row, CM.COL_PRECIO, allocations.length, 1).setNumberFormat('@');
-  shODV.getRange(row, CM.COL_SUBTOTAL, allocations.length, 1).setNumberFormat('0'); 
+  shODV.getRange(row, CM.COL_SUBTOTAL, allocations.length, 1).setNumberFormat('0');
+  shODV.getRange(row, CM.COL_PEDIDO_ID, allocations.length, 1).setNumberFormat('@');
 
   return true;
 }
@@ -966,14 +1127,14 @@ function CM_limpiarODVCompleta() {
   const lastRow = sh.getLastRow();
   if (lastRow < 2) return;
 
-  sh.getRange(2, 1, lastRow - 1, CM.COL_TIMESTAMP).clearContent();
+  sh.getRange(2, 1, lastRow - 1, CM.COL_PEDIDO_ID).clearContent();
 
   CM_actualizarResumenDMI();
-  ss.toast('🧽 ODV limpiada completa (A..L).', 'Carga Masiva AG', 6);
+  ss.toast('🧽 ODV limpiada completa (A..N).', 'Carga Masiva AG', 6);
 }
 
 function limpiarFilaCompleta_(shODV, row) {
-  shODV.getRange(row, 1, 1, CM.COL_TIMESTAMP).clearContent();
+  shODV.getRange(row, 1, 1, CM.COL_PEDIDO_ID).clearContent();
 }
 
 function clearRowOutputs_(shODV, row) {
@@ -983,7 +1144,7 @@ function clearRowOutputs_(shODV, row) {
 }
 
 /***************************************************************
- * RESUMEN DMI (ODVs a generar) 
+ * RESUMEN DMI (ODVs a generar)
  ***************************************************************/
 function CM_actualizarResumenDMI() {
   const ss = SpreadsheetApp.getActive();
@@ -991,10 +1152,10 @@ function CM_actualizarResumenDMI() {
   if (!sh) return;
 
   const lastRow = sh.getLastRow();
-  const startCol = CM.SUMMARY_START_COL;
+  const startCol = CM.SUMMARY_START_COL; // columna P
 
-  // ✅ FIX: Limpiamos agresivamente el panel derecho para matar cualquier fantasma
-  sh.getRange(1, 13, sh.getMaxRows(), 10).clearContent().clearFormat();
+  // Limpiamos panel de resumen (col O en adelante, no tocamos N)
+  sh.getRange(1, 15, sh.getMaxRows(), 10).clearContent().clearFormat();
 
   sh.getRange(CM.SUMMARY_TITLE_ROW, startCol, 1, 7)
     .merge()
@@ -1210,17 +1371,6 @@ function chooseLot_(lots) {
 /***************************************************************
  * EXPORT HELPERS
  ***************************************************************/
-function headerMap_(sheet, headerRow) {
-  const lastCol = sheet.getLastColumn();
-  const headers = sheet.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
-  const map = {};
-  headers.forEach((h, i) => {
-    const k = norm_(h);
-    if (k) map[k] = i; // Guardamos el índice (0-based)
-  });
-  return map;
-}
-
 function getOrCreateFolder_(name) {
   const it = DriveApp.getFoldersByName(name);
   if (it.hasNext()) return it.next();
@@ -1296,14 +1446,10 @@ function rangesIntersect_(r1, c1, nr1, nc1, r2, c2, nr2, nc2) {
   return !(r1b < r2 || r2b < r1 || c1b < c2 || c2b < c1);
 }
 
-/***************************************************************
- * MAGIA CSV: Convierte las matrices a formato texto puro delimitado
- ***************************************************************/
 function arrayToCsv_(data, separator) {
   return data.map(row => 
     row.map(val => {
       let str = String(val || '');
-      // Si el texto tiene saltos de línea, el separador, o comillas, lo encierra en comillas dobles
       if (str.includes(separator) || str.includes('"') || str.includes('\n')) {
         str = '"' + str.replace(/"/g, '""') + '"';
       }
